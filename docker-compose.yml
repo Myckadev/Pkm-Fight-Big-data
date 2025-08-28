@@ -1,0 +1,87 @@
+services:
+  postgres-core:
+    image: postgres:15
+    container_name: postgres-core
+    environment:
+      POSTGRES_DB: poke_core
+      POSTGRES_USER: core_user
+      POSTGRES_PASSWORD: core_pass
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./db/core_data:/var/lib/postgresql/data
+      - ./db/init_core.sql:/docker-entrypoint-initdb.d/init_core.sql
+
+  postgres-dwh:
+    image: postgres:15
+    container_name: postgres-dwh
+    environment:
+      POSTGRES_DB: poke_dwh
+      POSTGRES_USER: dwh_user
+      POSTGRES_PASSWORD: dwh_pass
+    ports:
+      - "5434:5432"
+    volumes:
+      - ./db/dwh_data:/var/lib/postgresql/data
+      - ./db/init_dwh.sql:/docker-entrypoint-initdb.d/init_dwh.sql
+
+  run-init:
+    image: python:3.12-slim
+    container_name: run-init
+    working_dir: /app
+    command: sh -c "pip install --no-cache-dir pandas sqlalchemy psycopg2-binary requests tqdm && python scripts/run.py --csv datalake/raw/csv/pokemon.csv"
+    environment:
+      DB_HOST: postgres-dwh
+      DB_PORT: 5432
+      DB_NAME: poke_dwh
+      DB_USER: dwh_user
+      DB_PASSWORD: dwh_pass
+    volumes:
+      - .:/app
+    depends_on:
+      - postgres-dwh
+
+  backend:
+    build: ./backend
+    container_name: poke-backend
+    command: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    environment:
+      CORE_DB_HOST: postgres-core
+      CORE_DB_PORT: 5432
+      CORE_DB_NAME: poke_core
+      CORE_DB_USER: core_user
+      CORE_DB_PASSWORD: core_pass
+      DWH_DB_HOST: postgres-dwh
+      DWH_DB_PORT: 5432
+      DWH_DB_NAME: poke_dwh
+      DWH_DB_USER: dwh_user
+      DWH_DB_PASSWORD: dwh_pass
+      FRONTEND_ORIGIN: http://localhost:5173
+      JWT_SECRET: super-dev-secret
+    volumes:
+      - ./backend:/app
+      - ./datalake:/app/datalake:ro
+    depends_on:
+      - postgres-core
+      - postgres-dwh
+
+
+  frontend:
+    build: ./frontend
+    container_name: poke-frontend
+    command: npm run dev
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      VITE_API_URL: http://localhost:8000
+    depends_on:
+      - backend
+
+volumes:
+  dwh_data:
+  core_data:

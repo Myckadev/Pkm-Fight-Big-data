@@ -1,0 +1,27 @@
+{
+  "types": {
+    "normal": "/icons/type_normal.svg",
+    "fire": "/icons/type_fire.svg",
+    "water": "/icons/type_water.svg",
+    "grass": "/icons/type_grass.svg",
+    "electric": "/icons/type_electric.svg",
+    "ice": "/icons/type_ice.svg",
+    "fighting": "/icons/type_fighting.svg",
+    "poison": "/icons/type_poison.svg",
+    "ground": "/icons/type_ground.svg",
+    "flying": "/icons/type_flying.svg",
+    "psychic": "/icons/type_psychic.svg",
+    "bug": "/icons/type_bug.svg",
+    "rock": "/icons/type_rock.svg",
+    "ghost": "/icons/type_ghost.svg",
+    "dragon": "/icons/type_dragon.svg",
+    "dark": "/icons/type_dark.svg",
+    "steel": "/icons/type_steel.svg",
+    "fairy": "/icons/type_fairy.svg"
+  },
+  "damage_classes": {
+    "physical": "/icons/class_physical.svg",
+    "special": "/icons/class_special.svg",
+    "status": "/icons/class_status.svg"
+  }
+}

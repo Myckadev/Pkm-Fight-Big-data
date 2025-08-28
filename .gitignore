@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Node / Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Datalake build artifacts (on garde seulement le CSV source)
+datalake/bronze/
+datalake/silver/
+datalake/gold/
+# on autorise le CSV Kaggle principal
+datalake/raw/csv/*
+!datalake/raw/csv/pokemon.csv
+
+# Backend generated data
+backend/datalake/silver/
+backend/static/sprites/
+backend/.venv/
+backend/.env
+
+# Logs / temp
+logs/
+tmp/
+*.log
