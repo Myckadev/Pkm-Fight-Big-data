@@ -4,9 +4,9 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from typing import Optional
 
-from ..db import engine_core
-from ..utils.security import create_access_token, hash_password, verify_password, decode_token
-from ..schemas import UserCreate, UserOut, TokenOut
+from db import engine_core
+from utils.security import create_access_token, hash_password, verify_password, decode_token
+from schemas import UserCreate, UserOut, TokenOut
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 

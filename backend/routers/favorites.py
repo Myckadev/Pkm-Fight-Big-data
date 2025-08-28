@@ -2,9 +2,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
 from typing import List
 
-from ..db import engine_core, engine_dwh
-from .auth import get_current_user
-from ..schemas import FavoriteIn, FavoriteOut
+from db import engine_core, engine_dwh
+from routers.auth import get_current_user
+from schemas import FavoriteIn, FavoriteOut
 
 router = APIRouter(prefix="/favorites", tags=["favorites"])
 

@@ -2,8 +2,8 @@ from fastapi import APIRouter, HTTPException, Query
 from typing import Optional, List, Dict, Any
 from sqlalchemy import text
 
-from ..db import engine_dwh
-from ..schemas import PokemonListResponse, PokemonListItem, PokemonDetail
+from db import engine_dwh
+from schemas import PokemonListResponse, PokemonListItem, PokemonDetail
 
 router = APIRouter(prefix="/pokedex", tags=["pokedex"])
 

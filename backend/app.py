@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.staticfiles import StaticFiles
 import os
 
-from .routers import pokedex, auth, favorites
+from routers import pokedex, auth, favorites
 
 app = FastAPI(title="Poke-Lakehouse API", version="1.0.0")
 
