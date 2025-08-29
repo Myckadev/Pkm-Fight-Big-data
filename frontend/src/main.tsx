@@ -1,13 +1,14 @@
-import React from 'react'
 import ReactDOM from 'react-dom/client'
 import App from './App'
-import '@fontsource/roboto/300.css'
-import '@fontsource/roboto/400.css'
-import '@fontsource/roboto/500.css'
-import '@fontsource/roboto/700.css'
+import { CssBaseline, GlobalStyles } from '@mui/material'
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode>
+  <>
+    <CssBaseline />
+    <GlobalStyles styles={{
+      'html, body, #root': { height: '100%', overflow: 'hidden' },
+      'body': { backgroundColor: '#fafafa' }
+    }} />
     <App />
-  </React.StrictMode>,
+  </>
 )

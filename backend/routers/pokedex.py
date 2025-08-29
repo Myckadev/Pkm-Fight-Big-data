@@ -1,261 +1,336 @@
-from fastapi import APIRouter, HTTPException, Query
-from typing import Optional, List, Dict, Any
+from fastapi import APIRouter, HTTPException, Query, Header
+from typing import Optional, Dict
 from sqlalchemy import text
-
 from db import engine_dwh
-from schemas import PokemonListResponse, PokemonListItem, PokemonDetail
 
 router = APIRouter(prefix="/pokedex", tags=["pokedex"])
 
-# ---------- Helpers ----------
-def _apply_filters_sql(base: str, params: dict) -> tuple[str, dict]:
-    where = []
-    if q := params.get("search"):
-        where.append("(LOWER(name) LIKE :q)")
-        params["q"] = f"%{q.lower()}%"
-    if t := params.get("type"):
-        where.append("(type1 = :t OR type2 = :t)")
-        params["t"] = t.lower()
-    if g := params.get("generation"):
-        where.append("generation = :g")
-        params["g"] = str(g)
-    if params.get("legendary") is not None:
-        where.append("is_legendary = :leg")
-    if where:
-        base += " WHERE " + " AND ".join(where)
-    return base, params
+# ----- Langues gérées -----
+VALID_LANGS = {"en", "fr", "es"}
 
-# ---------- List ----------
-@router.get("/pokemon", response_model=PokemonListResponse)
+def pick_lang(lang: Optional[str], accept_language: Optional[str]) -> str:
+    """
+    Langue par défaut = FR. Si non fournie, tente de lire Accept-Language.
+    """
+    if lang and lang.lower() in VALID_LANGS:
+        return lang.lower()
+    if accept_language:
+        for token in accept_language.split(","):
+            code = token.strip().split(";")[0].split("-")[0].lower()
+            if code in VALID_LANGS:
+                return code
+    return "fr"
+
+def coalesce(expr_prefix: str, lang: str) -> str:
+    """
+    Pour les tables qui possèdent une colonne 'base' + multilang (ex: dim_pokemon.name, dim_item.name, dim_move.name).
+    Retourne: COALESCE(prefix_lang, prefix_en, prefix)
+    """
+    return f"COALESCE({expr_prefix}_{lang}, {expr_prefix}_en, {expr_prefix})"
+
+def coalesce_species(prefix: str, lang: str) -> str:
+    """
+    Pour les champs SANS colonne 'base' (ex: pokemon_species.genus/flavor, dim_move.effect).
+    Retourne la meilleure dispo selon la langue souhaitée, puis les autres en fallback.
+    """
+    order = [lang] + [x for x in ("en", "fr", "es") if x != lang]
+    return "COALESCE(" + ", ".join(f"{prefix}_{l}" for l in order) + ")"
+
+def sprite_front_hd_alias() -> str:
+    """
+    Alias d'image front pour la liste : HD prioritaire (official > home > default).
+    """
+    return "COALESCE(sprite_official_front, sprite_home_front, sprite_front)"
+
+
+# -------------------------------------------------------------------
+# LISTE POKÉDEX (HD par défaut)
+# -------------------------------------------------------------------
+@router.get("/pokemon")
 def list_pokemon(
-    search: Optional[str] = None,
-    type: Optional[str] = Query(None, alias="type"),
-    generation: Optional[str] = None,
-    legendary: Optional[bool] = None,
+    search: Optional[str] = Query(None, alias="q"),
+    type_: Optional[str] = Query(None, alias="type"),
+    generation: Optional[str] = Query(None, alias="gen"),
+    legendary: Optional[bool] = Query(None, alias="leg"),
     page: int = 1,
-    page_size: int = 30
+    page_size: int = 30,
+    lang: Optional[str] = None,
+    accept_language: Optional[str] = Header(None),
 ):
     if page < 1 or page_size < 1 or page_size > 200:
         raise HTTPException(400, "Invalid pagination")
+    lang = pick_lang(lang, accept_language)
 
-    params = {"search": search, "type": type, "generation": generation, "legendary": legendary}
-    base_sql = "SELECT pokedex_number, name, type1, NULLIF(type2,'') as type2, total_stats, is_legendary, generation, sprite_front FROM dim_pokemon"
-    count_sql = "SELECT COUNT(1) FROM dim_pokemon"
-    base_sql, p = _apply_filters_sql(base_sql, params.copy())
-    count_sql, pc = _apply_filters_sql(count_sql, params.copy())
+    name_expr = coalesce("name", lang)
+    where, params = [], {}
+    if search:
+        where.append(f"LOWER({name_expr}) LIKE :q")
+        params["q"] = f"%{search.lower()}%"
+    if type_:
+        where.append("(type1 = :t OR type2 = :t)")
+        params["t"] = type_.lower()
+    if generation:
+        where.append("generation = :g")
+        params["g"] = str(generation)
+    if legendary is not None:
+        where.append("is_legendary = :leg")
+        params["leg"] = legendary
+
+    sql_base = f"""
+        SELECT
+          pokedex_number,
+          {name_expr} AS name,
+          type1, NULLIF(type2,'') AS type2,
+          total_stats, is_legendary, generation,
+          {sprite_front_hd_alias()} AS sprite_front
+        FROM dim_pokemon
+    """
+    sql_count = "SELECT COUNT(1) FROM dim_pokemon"
+    if where:
+        filt = " WHERE " + " AND ".join(where)
+        sql_base += filt
+        sql_count += filt
 
     offset = (page - 1) * page_size
-    base_sql += " ORDER BY pokedex_number LIMIT :limit OFFSET :offset"
-    p.update({"limit": page_size, "offset": offset})
+    sql_base += " ORDER BY pokedex_number LIMIT :l OFFSET :o"
+    params.update({"l": page_size, "o": offset})
 
     with engine_dwh.begin() as conn:
-        total = conn.execute(text(count_sql), pc).scalar()
-        rows = conn.execute(text(base_sql), p).mappings().all()
+        total = conn.execute(text(sql_count), params).scalar()
+        rows = conn.execute(text(sql_base), params).mappings().all()
 
-    items = [PokemonListItem(**row) for row in rows]
-    return {"total": total, "page": page, "page_size": page_size, "results": items}
+    return {"total": total, "page": page, "page_size": page_size, "results": rows}
 
-# ---------- Detail ----------
-@router.get("/pokemon/{dex}", response_model=PokemonDetail)
-def pokemon_detail(dex: int):
+
+# -------------------------------------------------------------------
+# DÉTAIL POKÉMON (tous les sprites + textes localisés)
+# -------------------------------------------------------------------
+@router.get("/pokemon/{dex}")
+def pokemon_detail(
+    dex: int,
+    lang: Optional[str] = None,
+    accept_language: Optional[str] = Header(None),
+):
+    lang = pick_lang(lang, accept_language)
+    name_expr   = coalesce("dp.name", lang)
+    genus_expr  = coalesce_species("ps.genus", lang)     # pas de ps.genus "base"
+    flavor_expr = coalesce_species("ps.flavor", lang)    # pas de ps.flavor "base"
+
     with engine_dwh.begin() as conn:
-        p = conn.execute(text("""
-            SELECT pokedex_number, name, type1, NULLIF(type2,'') as type2,
-                   hp, attack, defense, sp_attack, sp_defense, speed, total_stats,
-                   sprite_front, sprite_back, is_legendary, generation
-            FROM dim_pokemon WHERE pokedex_number = :d
-        """), {"d": dex}).mappings().first()
+        # Pokémon + species (on récupère aussi flavor_fr/en pour le front existant)
+        p = conn.execute(
+            text(f"""
+                SELECT
+                  dp.pokedex_number,
+                  {name_expr} AS name,
+                  dp.type1, NULLIF(dp.type2,'') AS type2,
+                  dp.hp, dp.attack, dp.defense, dp.sp_attack, dp.sp_defense, dp.speed, dp.total_stats,
+                  dp.sprite_front, dp.sprite_back,
+                  dp.sprite_front_shiny, dp.sprite_back_shiny,
+                  dp.sprite_official_front, dp.sprite_official_front_shiny,
+                  dp.sprite_home_front, dp.sprite_home_front_shiny,
+                  dp.is_legendary, dp.generation,
+                  {genus_expr}  AS genus,
+                  {flavor_expr} AS flavor_text,
+                  ps.flavor_fr, ps.flavor_en
+                FROM dim_pokemon dp
+                LEFT JOIN pokemon_species ps ON ps.pokedex_number = dp.pokedex_number
+                WHERE dp.pokedex_number = :d
+            """),
+            {"d": dex}
+        ).mappings().first()
         if not p:
             raise HTTPException(404, "Pokémon not found")
 
-        species = conn.execute(text("""
-            SELECT is_legendary, is_mythical, is_baby, base_happiness, capture_rate,
-                   color, shape, growth_rate, habitat, generation as species_generation,
-                   egg_groups, flavor_en, flavor_fr
-            FROM pokemon_species WHERE pokedex_number=:d
-        """), {"d": dex}).mappings().first()
+        # Moves localisés (nom + effet). NOTE: dim_move.effect_* SANS colonne "effect"
+        m_name        = coalesce("m.name", lang)                # ici 'name' a une colonne base -> coalesce()
+        m_effect_only = coalesce_species("m.effect", lang)      # ici SANS base -> coalesce_species()
+        moves = conn.execute(
+            text(f"""
+                SELECT
+                  m.move_id,
+                  {m_name}   AS name,
+                  m.name     AS slug,
+                  m.type, m.power, m.accuracy, m.pp, m.priority, m.damage_class,
+                  {m_effect_only} AS effect
+                FROM bridge_pokemon_move b
+                JOIN dim_move m ON m.name = b.move_name
+                WHERE b.pokedex_number = :d
+                ORDER BY {m_name}
+            """),
+            {"d": dex}
+        ).mappings().all()
 
-        matchups = conn.execute(text("""
-            SELECT * FROM pokemon_type_matchups WHERE pokedex_number=:d
-        """), {"d": dex}).mappings().first()
+        # Learnsets
+        learnsets = conn.execute(
+            text("""
+                SELECT move_name AS move, learn_method, level_learned_at, version_group, generation
+                FROM pokemon_move_learnset
+                WHERE pokedex_number=:d
+                ORDER BY version_group, learn_method, level_learned_at NULLS LAST, move_name
+            """),
+            {"d": dex}
+        ).mappings().all()
 
-        moves = conn.execute(text("""
-            SELECT dm.name, dm.type, dm.power, dm.accuracy, dm.pp, dm.priority, dm.damage_class, dm.effect
-            FROM bridge_pokemon_move bpm
-            JOIN dim_move dm ON dm.name = bpm.move_name
-            WHERE bpm.pokedex_number = :d
-            ORDER BY dm.name
-        """), {"d": dex}).mappings().all()
+        # Matchups
+        matchups = conn.execute(
+            text("SELECT * FROM pokemon_type_matchups WHERE pokedex_number=:d"),
+            {"d": dex}
+        ).mappings().first()
 
-        learnsets = conn.execute(text("""
-            SELECT move_name as move, learn_method, level_learned_at, version_group, generation
-            FROM pokemon_move_learnset
-            WHERE pokedex_number=:d
-            ORDER BY version_group, learn_method, level_learned_at NULLS LAST, move_name
-        """), {"d": dex}).mappings().all()
-
-        # evolutions: construire une "famille" à partir des edges
-        # on récupère le nom pour graph
-        name = p["name"]
-        edges = conn.execute(text("""
-            SELECT from_name, to_name, min_level, trigger, item, time_of_day, min_happiness,
-                   min_beauty, min_affection, held_item, known_move_type, location, gender
-            FROM evolution_edges
-        """)).mappings().all()
-
-    # Build family graph: BFS sur edges non orientés
-    nodes = set()
-    adj = {}
-    for e in edges:
-        a, b = e["from_name"], e["to_name"]
-        adj.setdefault(a, []).append(e)
-        # on stocke aussi inverse pour atteignabilité
-        inv = dict(e)
-        inv["from_name"], inv["to_name"] = b, a
-        adj.setdefault(b, []).append(inv)
-
-    if name in adj:
-        q = [name]
-        seen = {name}
-        fam_edges = []
-        while q:
-            cur = q.pop(0)
-            for e in adj.get(cur, []):
-                fam_edges.append(e)
-                nxt = e["to_name"]
-                if nxt not in seen:
-                    seen.add(nxt)
-                    q.append(nxt)
-        nodes = seen
-    else:
-        fam_edges = []
-
-    detail = PokemonDetail(
-        pokedex_number=p["pokedex_number"],
-        name=p["name"],
-        types=[p["type1"]] + ([p["type2"]] if p["type2"] else []),
-        stats={
+    # Assemblage (donne TOUTES les variantes de sprites au front)
+    sprites: Dict[str, Optional[str]] = {
+        "front":                p["sprite_front"],
+        "back":                 p["sprite_back"],
+        "front_shiny":          p["sprite_front_shiny"],
+        "back_shiny":           p["sprite_back_shiny"],
+        "official_front":       p["sprite_official_front"],
+        "official_front_shiny": p["sprite_official_front_shiny"],
+        "home_front":           p["sprite_home_front"],
+        "home_front_shiny":     p["sprite_home_front_shiny"],
+    }
+    detail = {
+        "dex": p["pokedex_number"],
+        "name": p["name"],
+        "types": [p["type1"]] + ([p["type2"]] if p["type2"] else []),
+        "stats": {
             "hp": p["hp"], "atk": p["attack"], "def": p["defense"],
             "spa": p["sp_attack"], "spd": p["sp_defense"], "spe": p["speed"],
-            "total": p["total_stats"]
+            "total": p["total_stats"],
         },
-        sprites={"front": p["sprite_front"], "back": p["sprite_back"]},
-        species=species or {},
-        matchups={k: v for k, v in (dict(matchups or {})).items() if k.startswith("vs_")},
-        moves=[dict(m) for m in moves],
-        learnsets=[dict(l) for l in learnsets],
-        evolutions={"nodes": sorted(nodes), "edges": [dict(e) for e in fam_edges]}
-    )
+        "sprites": sprites,
+        "species": {
+            "genus": p["genus"],
+            "flavor": p["flavor_text"],
+            "flavor_fr": p["flavor_fr"],
+            "flavor_en": p["flavor_en"],
+        },
+        "matchups": {k: v for k, v in dict(matchups or {}).items() if k.startswith("vs_")},
+        "moves": [dict(m) for m in moves],
+        "learnsets": [dict(l) for l in learnsets],
+    }
     return detail
 
-# ---------- Moves ----------
+
+# -------------------------------------------------------------------
+# LISTE DES MOVES (localisé)
+# -------------------------------------------------------------------
 @router.get("/moves")
 def list_moves(
     search: Optional[str] = None,
-    type: Optional[str] = Query(None, alias="type"),
+    type_: Optional[str] = Query(None, alias="type"),
     damage_class: Optional[str] = None,
     page: int = 1,
-    page_size: int = 50
+    page_size: int = 50,
+    lang: Optional[str] = None,
+    accept_language: Optional[str] = Header(None),
 ):
     if page < 1 or page_size < 1 or page_size > 200:
         raise HTTPException(400, "Invalid pagination")
-    sql = "SELECT move_id, name, type, power, accuracy, pp, priority, damage_class, effect FROM dim_move"
-    params = {}
-    where = []
+    lang = pick_lang(lang, accept_language)
+    name_expr        = coalesce("name", lang)             # a une colonne base
+    effect_expr_only = coalesce_species("effect", lang)   # SANS colonne base
+
+    sql = f"""
+      SELECT move_id,
+             {name_expr}   AS name,
+             name          AS slug,
+             type, power, accuracy, pp, priority, damage_class,
+             {effect_expr_only} AS effect
+      FROM dim_move
+    """
+    params, where = {}, []
     if search:
-        where.append("LOWER(name) LIKE :q")
+        where.append(f"LOWER({name_expr}) LIKE :q")
         params["q"] = f"%{search.lower()}%"
-    if type:
-        where.append("type = :t")
-        params["t"] = type.lower()
+    if type_:
+        where.append("type = :t"); params["t"] = type_.lower()
     if damage_class:
-        where.append("damage_class = :dc")
-        params["dc"] = damage_class.lower()
+        where.append("damage_class = :dc"); params["dc"] = damage_class.lower()
     if where:
         sql += " WHERE " + " AND ".join(where)
     count_sql = "SELECT COUNT(1) FROM (" + sql + ") x"
-    sql += " ORDER BY name LIMIT :l OFFSET :o"
+    sql += " ORDER BY " + name_expr + " LIMIT :l OFFSET :o"
     params.update({"l": page_size, "o": (page-1)*page_size})
     with engine_dwh.begin() as conn:
         total = conn.execute(text(count_sql), params).scalar()
         rows = conn.execute(text(sql), params).mappings().all()
     return {"total": total, "page": page, "page_size": page_size, "results": rows}
 
-# ---------- Items ----------
+
+# -------------------------------------------------------------------
+# LISTE DES ITEMS (localisé)
+# -------------------------------------------------------------------
 @router.get("/items")
 def list_items(
     search: Optional[str] = None,
     category: Optional[str] = None,
     page: int = 1,
-    page_size: int = 50
+    page_size: int = 50,
+    lang: Optional[str] = None,
+    accept_language: Optional[str] = Header(None),
 ):
     if page < 1 or page_size < 1 or page_size > 200:
         raise HTTPException(400, "Invalid pagination")
-    sql = "SELECT item_id, name, category, cost, effect, sprite_url, is_competitive_core FROM dim_item"
-    params = {}
-    where = []
+    lang = pick_lang(lang, accept_language)
+    name_expr   = coalesce("name", lang)             # dim_item a 'name' base
+    effect_expr = coalesce("effect", lang)           # dim_item a 'effect' base
+
+    sql = f"""
+      SELECT item_id,
+             {name_expr}   AS name,
+             name          AS slug,
+             category, cost,
+             {effect_expr} AS effect,
+             sprite_url,
+             is_competitive_core
+      FROM dim_item
+    """
+    params, where = {}, []
     if search:
-        where.append("LOWER(name) LIKE :q")
+        where.append(f"LOWER({name_expr}) LIKE :q")
         params["q"] = f"%{search.lower()}%"
     if category:
-        where.append("category = :c")
-        params["c"] = category
+        where.append("category = :c"); params["c"] = category
     if where:
         sql += " WHERE " + " AND ".join(where)
     count_sql = "SELECT COUNT(1) FROM (" + sql + ") x"
-    sql += " ORDER BY name LIMIT :l OFFSET :o"
+    sql += " ORDER BY " + name_expr + " LIMIT :l OFFSET :o"
     params.update({"l": page_size, "o": (page-1)*page_size})
     with engine_dwh.begin() as conn:
         total = conn.execute(text(count_sql), params).scalar()
         rows = conn.execute(text(sql), params).mappings().all()
     return {"total": total, "page": page, "page_size": page_size, "results": rows}
 
-# ---------- Type chart ----------
+
+# -------------------------------------------------------------------
+# TYPE CHART (pour le hook front)
+# -------------------------------------------------------------------
 @router.get("/type-chart")
 def type_chart():
     with engine_dwh.begin() as conn:
-        rows = conn.execute(text("SELECT attacking, defending, multiplier FROM type_chart ORDER BY attacking, defending")).mappings().all()
-    return rows
+        rows = conn.execute(
+            text("SELECT attacking, defending, multiplier FROM type_chart ORDER BY attacking, defending")
+        ).mappings().all()
+    return [dict(r) for r in rows]
 
-# ---------- Evolutions direct par nom/dex ----------
-@router.get("/evolutions/{dex_or_name}")
-def evolutions(dex_or_name: str):
-    # si chiffre => on récupère le nom
-    try:
-        dex = int(dex_or_name)
-        with engine_dwh.begin() as conn:
-            row = conn.execute(text("SELECT name FROM dim_pokemon WHERE pokedex_number=:d"), {"d": dex}).first()
-        if not row:
-            raise HTTPException(404, "Pokémon not found")
-        name = row[0]
-    except ValueError:
-        name = dex_or_name.lower()
 
+# -------------------------------------------------------------------
+# LISTE DES TYPES (localisé) — utile pour filtres/puces
+# -------------------------------------------------------------------
+@router.get("/types")
+def list_types(
+    lang: Optional[str] = None,
+    accept_language: Optional[str] = Header(None),
+):
+    lang = pick_lang(lang, accept_language)
+    name_expr = coalesce("name", lang)  # dim_type possède name + name_{en,fr,es}
     with engine_dwh.begin() as conn:
-        edges = conn.execute(text("""
-            SELECT from_name, to_name, min_level, trigger, item, time_of_day, min_happiness,
-                   min_beauty, min_affection, held_item, known_move_type, location, gender
-            FROM evolution_edges
-        """)).mappings().all()
-
-    adj = {}
-    nodes = set()
-    for e in edges:
-        a, b = e["from_name"], e["to_name"]
-        adj.setdefault(a, []).append(e)
-        inv = dict(e); inv["from_name"], inv["to_name"] = b, a
-        adj.setdefault(b, []).append(inv)
-
-    if name not in adj:
-        return {"nodes": [name], "edges": []}
-
-    q = [name]; seen = {name}; fam_edges = []
-    while q:
-        cur = q.pop(0)
-        for e in adj.get(cur, []):
-            fam_edges.append(e)
-            nxt = e["to_name"]
-            if nxt not in seen:
-                seen.add(nxt); q.append(nxt)
-
-    return {"nodes": sorted(seen), "edges": fam_edges}
+        rows = conn.execute(
+            text(f"""
+                SELECT type_id, name AS slug, {name_expr} AS name
+                FROM dim_type
+                ORDER BY type_id
+            """)
+        ).mappings().all()
+    return [dict(r) for r in rows]
